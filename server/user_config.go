@@ -6,6 +6,7 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/runatlantis/atlantis/server/auth"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/logging"
 )
@@ -134,11 +135,19 @@ type UserConfig struct {
 	UseTFPluginCache           bool            `mapstructure:"use-tf-plugin-cache"`
 }
 
+func (u UserConfig) AuthValidator(logger logging.SimpleLogging) auth.Validator {
+	if u.WebUsername != "" && u.WebPassword != "" {
+		return auth.NewBasic(logger, u.WebUsername, u.WebPassword)
+	}
+
+	return nil
+}
+
 // ToAllowCommandNames parse AllowCommands into a slice of CommandName
 func (u UserConfig) ToAllowCommandNames() ([]command.Name, error) {
 	var allowCommands []command.Name
 	var hasAll bool
-	for _, input := range strings.Split(u.AllowCommands, ",") {
+	for input := range strings.SplitSeq(u.AllowCommands, ",") {
 		if input == "" {
 			continue
 		}

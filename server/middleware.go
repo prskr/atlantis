@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/runatlantis/atlantis/server/auth"
 	"github.com/runatlantis/atlantis/server/logging"
 	"github.com/urfave/negroni/v3"
 )
@@ -24,10 +25,9 @@ import (
 // NewRequestLogger creates a RequestLogger.
 func NewRequestLogger(s *Server) *RequestLogger {
 	return &RequestLogger{
-		s.Logger,
-		s.WebAuthentication,
-		s.WebUsername,
-		s.WebPassword,
+		logger:            s.Logger,
+		WebAuthentication: s.WebAuthentication,
+		Validator:         s.AuthValidator,
 	}
 }
 
@@ -36,8 +36,7 @@ func NewRequestLogger(s *Server) *RequestLogger {
 type RequestLogger struct {
 	logger            logging.SimpleLogging
 	WebAuthentication bool
-	WebUsername       string
-	WebPassword       string
+	Validator         auth.Validator
 }
 
 // ServeHTTP implements the middleware function. It logs all requests at DEBUG level.
@@ -51,23 +50,12 @@ func (l *RequestLogger) ServeHTTP(rw http.ResponseWriter, r *http.Request, next 
 		strings.HasPrefix(r.URL.Path, "/api/") {
 		allowed = true
 	} else {
-		user, pass, ok := r.BasicAuth()
-		if ok {
-			r.SetBasicAuth(user, pass)
-			if user == l.WebUsername && pass == l.WebPassword {
-				l.logger.Debug("[VALID] log in: >> url: %s", r.URL.RequestURI())
-				allowed = true
-			} else {
-				allowed = false
-				l.logger.Info("[INVALID] log in attempt: >> url: %s", r.URL.RequestURI())
-			}
-		}
+		allowed = l.Validator.Authenticate(rw, r)
 	}
-	if !allowed {
-		rw.Header().Set("WWW-Authenticate", `Basic realm="restricted", charset="UTF-8"`)
-		http.Error(rw, "Unauthorized", http.StatusUnauthorized)
-	} else {
+
+	if allowed {
 		next(rw, r)
 	}
+
 	l.logger.Debug("%s %s – respond HTTP %d", r.Method, r.URL.RequestURI(), rw.(negroni.ResponseWriter).Status())
 }

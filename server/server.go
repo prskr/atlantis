@@ -41,6 +41,7 @@ import (
 	prometheus "github.com/uber-go/tally/v4/prometheus"
 	"github.com/urfave/negroni/v3"
 
+	"github.com/runatlantis/atlantis/server/auth"
 	cfg "github.com/runatlantis/atlantis/server/core/config"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/db"
@@ -111,6 +112,7 @@ type Server struct {
 	StatusController               *controllers.StatusController
 	JobsController                 *controllers.JobsController
 	APIController                  *controllers.APIController
+	AuthController                 *controllers.AuthController
 	IndexTemplate                  web_templates.TemplateWriter
 	LockDetailTemplate             web_templates.TemplateWriter
 	ProjectJobsTemplate            web_templates.TemplateWriter
@@ -122,8 +124,7 @@ type Server struct {
 	SSLCert                        *tls.Certificate
 	Drainer                        *events.Drainer
 	WebAuthentication              bool
-	WebUsername                    string
-	WebPassword                    string
+	AuthValidator                  auth.Validator
 	ProjectCmdOutputHandler        jobs.ProjectCommandOutputHandler
 	ScheduledExecutorService       *scheduled.ExecutorService
 	DisableGlobalApplyLock         bool
@@ -172,7 +173,6 @@ var staticAssets embed.FS
 func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	logging.SuppressDefaultLogging()
 	logger, err := logging.NewStructuredLoggerFromLevel(userConfig.ToLogLevel())
-
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +225,6 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 
 	statsScope, statsReporter, closer, err := metrics.NewScope(globalCfg.Metrics, logger, userConfig.StatsNamespace)
-
 	if err != nil {
 		return nil, errors.Wrapf(err, "instantiating metrics scope")
 	}
@@ -416,13 +415,11 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	commitStatusUpdater := &events.DefaultCommitStatusUpdater{Client: vcsClient, StatusName: userConfig.VCSStatusName}
 
 	binDir, err := mkSubDir(userConfig.DataDir, BinDirName)
-
 	if err != nil {
 		return nil, err
 	}
 
 	cacheDir, err := mkSubDir(userConfig.DataDir, TerraformPluginCacheDirName)
-
 	if err != nil {
 		return nil, err
 	}
@@ -676,7 +673,6 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	)
 
 	showStepRunner, err := runtime.NewShowStepRunner(terraformClient, defaultTfDistribution, defaultTfVersion)
-
 	if err != nil {
 		return nil, errors.Wrap(err, "initializing show step runner")
 	}
@@ -686,7 +682,6 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		defaultTfVersion,
 		policy.NewConfTestExecutorWorkflow(logger, binDir, &policy.ConfTestGoGetterVersionDownloader{}),
 	)
-
 	if err != nil {
 		return nil, errors.Wrap(err, "initializing policy check step runner")
 	}
@@ -964,6 +959,8 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		CommitStatusUpdater:            commitStatusUpdater,
 	}
 
+	authController := &controllers.AuthController{}
+
 	eventsController := &events_controllers.VCSEventsController{
 		CommandRunner:                   commandRunner,
 		PullCleaner:                     pullClosedExecutor,
@@ -1016,6 +1013,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		JobsController:                 jobsController,
 		StatusController:               statusController,
 		APIController:                  apiController,
+		AuthController:                 authController,
 		IndexTemplate:                  web_templates.IndexTemplate,
 		LockDetailTemplate:             web_templates.LockTemplate,
 		ProjectJobsTemplate:            web_templates.ProjectJobsTemplate,
@@ -1026,8 +1024,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		Drainer:                        drainer,
 		ProjectCmdOutputHandler:        projectCmdOutputHandler,
 		WebAuthentication:              userConfig.WebBasicAuth,
-		WebUsername:                    userConfig.WebUsername,
-		WebPassword:                    userConfig.WebPassword,
+		AuthValidator:                  userConfig.AuthValidator(logger),
 		ScheduledExecutorService:       scheduledExecutorService,
 		EnableProfilingAPI:             userConfig.EnableProfilingAPI,
 	}
@@ -1047,28 +1044,29 @@ func (s *Server) Start() error {
 	s.Router.HandleFunc("/", s.Index).Methods("GET").MatcherFunc(func(r *http.Request, rm *mux.RouteMatch) bool {
 		return r.URL.Path == "/" || r.URL.Path == "/index.html"
 	})
-	s.Router.HandleFunc("/healthz", s.Healthz).Methods("GET")
-	s.Router.HandleFunc("/status", s.StatusController.Get).Methods("GET")
+	s.Router.HandleFunc("/healthz", s.Healthz).Methods(http.MethodGet)
+	s.Router.HandleFunc("/status", s.StatusController.Get).Methods(http.MethodGet)
 	s.Router.PathPrefix("/static/").Handler(http.FileServer(http.FS(staticAssets)))
-	s.Router.HandleFunc("/events", s.VCSEventsController.Post).Methods("POST")
-	s.Router.HandleFunc("/api/plan", s.APIController.Plan).Methods("POST")
-	s.Router.HandleFunc("/api/apply", s.APIController.Apply).Methods("POST")
-	s.Router.HandleFunc("/api/locks", s.APIController.ListLocks).Methods("GET")
-	s.Router.HandleFunc("/github-app/exchange-code", s.GithubAppController.ExchangeCode).Methods("GET")
-	s.Router.HandleFunc("/github-app/setup", s.GithubAppController.New).Methods("GET")
-	s.Router.HandleFunc("/locks", s.LocksController.DeleteLock).Methods("DELETE").Queries("id", "{id:.*}")
-	s.Router.HandleFunc("/lock", s.LocksController.GetLock).Methods("GET").
+	s.Router.HandleFunc("/events", s.VCSEventsController.Post).Methods(http.MethodPost)
+	s.Router.HandleFunc("/api/plan", s.APIController.Plan).Methods(http.MethodPost)
+	s.Router.HandleFunc("/api/apply", s.APIController.Apply).Methods(http.MethodPost)
+	s.Router.HandleFunc("/api/locks", s.APIController.ListLocks).Methods(http.MethodGet)
+	s.Router.HandleFunc("/auth/oidc/callback", s.AuthController.HandleOIDCCallback).Methods(http.MethodGet)
+	s.Router.HandleFunc("/github-app/exchange-code", s.GithubAppController.ExchangeCode).Methods(http.MethodGet)
+	s.Router.HandleFunc("/github-app/setup", s.GithubAppController.New).Methods(http.MethodGet)
+	s.Router.HandleFunc("/locks", s.LocksController.DeleteLock).Methods(http.MethodDelete).Queries("id", "{id:.*}")
+	s.Router.HandleFunc("/lock", s.LocksController.GetLock).Methods(http.MethodGet).
 		Queries(LockViewRouteIDQueryParam, fmt.Sprintf("{%s}", LockViewRouteIDQueryParam)).Name(LockViewRouteName)
-	s.Router.HandleFunc("/jobs/{job-id}", s.JobsController.GetProjectJobs).Methods("GET").Name(ProjectJobsViewRouteName)
-	s.Router.HandleFunc("/jobs/{job-id}/ws", s.JobsController.GetProjectJobsWS).Methods("GET")
+	s.Router.HandleFunc("/jobs/{job-id}", s.JobsController.GetProjectJobs).Methods(http.MethodGet).Name(ProjectJobsViewRouteName)
+	s.Router.HandleFunc("/jobs/{job-id}/ws", s.JobsController.GetProjectJobsWS).Methods(http.MethodGet)
 
 	r, ok := s.StatsReporter.(prometheus.Reporter)
 	if ok {
 		s.Router.Handle(s.CommandRunner.GlobalCfg.Metrics.Prometheus.Endpoint, r.HTTPHandler())
 	}
 	if !s.DisableGlobalApplyLock {
-		s.Router.HandleFunc("/apply/lock", s.LocksController.LockApply).Methods("POST").Queries()
-		s.Router.HandleFunc("/apply/unlock", s.LocksController.UnlockApply).Methods("DELETE").Queries()
+		s.Router.HandleFunc("/apply/lock", s.LocksController.LockApply).Methods(http.MethodPost).Queries()
+		s.Router.HandleFunc("/apply/unlock", s.LocksController.UnlockApply).Methods(http.MethodDelete).Queries()
 	}
 
 	if s.EnableProfilingAPI {
@@ -1079,7 +1077,7 @@ func (s *Server) Start() error {
 			"/symbol":  pprof.Symbol,
 			"/trace":   pprof.Trace,
 		} {
-			s.Router.HandleFunc("/debug/pprof"+p, h).Methods("GET")
+			s.Router.HandleFunc("/debug/pprof"+p, h).Methods(http.MethodGet)
 		}
 	}
 
@@ -1198,7 +1196,7 @@ func (s *Server) Index(w http.ResponseWriter, _ *http.Request) {
 		GlobalApplyLockEnabled: applyCmdLock.GlobalApplyLockEnabled,
 		TimeFormatted:          applyCmdLock.Time.Format("2006-01-02 15:04:05"),
 	}
-	//Sort by date - newest to oldest.
+	// Sort by date - newest to oldest.
 	sort.SliceStable(lockResults, func(i, j int) bool { return lockResults[i].Time.After(lockResults[j].Time) })
 
 	err = s.IndexTemplate.Execute(w, web_templates.IndexData{
@@ -1214,7 +1212,6 @@ func (s *Server) Index(w http.ResponseWriter, _ *http.Request) {
 }
 
 func preparePullToJobMappings(s *Server) []jobs.PullInfoWithJobIDs {
-
 	pullToJobMappings := s.ProjectCmdOutputHandler.GetPullToJobMapping()
 
 	for i := range pullToJobMappings {
@@ -1224,13 +1221,13 @@ func preparePullToJobMappings(s *Server) []jobs.PullInfoWithJobIDs {
 			pullToJobMappings[i].JobIDInfos[j].TimeFormatted = pullToJobMappings[i].JobIDInfos[j].Time.Format("2006-01-02 15:04:05")
 		}
 
-		//Sort by date - newest to oldest.
+		// Sort by date - newest to oldest.
 		sort.SliceStable(pullToJobMappings[i].JobIDInfos, func(x, y int) bool {
 			return pullToJobMappings[i].JobIDInfos[x].Time.After(pullToJobMappings[i].JobIDInfos[y].Time)
 		})
 	}
 
-	//Sort by repository, project, path, workspace then date.
+	// Sort by repository, project, path, workspace then date.
 	sort.SliceStable(pullToJobMappings, func(x, y int) bool {
 		if pullToJobMappings[x].Pull.RepoFullName != pullToJobMappings[y].Pull.RepoFullName {
 			return pullToJobMappings[x].Pull.RepoFullName < pullToJobMappings[y].Pull.RepoFullName
@@ -1249,7 +1246,7 @@ func preparePullToJobMappings(s *Server) []jobs.PullInfoWithJobIDs {
 
 func mkSubDir(parentDir string, subDir string) (string, error) {
 	fullDir := filepath.Join(parentDir, subDir)
-	if err := os.MkdirAll(fullDir, 0700); err != nil {
+	if err := os.MkdirAll(fullDir, 0o700); err != nil {
 		return "", errors.Wrapf(err, "unable to create dir %q", fullDir)
 	}
 
